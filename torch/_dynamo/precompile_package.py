@@ -1273,6 +1273,8 @@ _SHAPE_BEARING_GUARD_TYPES = frozenset(
         "FUNCTION_CODE_MATCH",
         "HASATTR",
         "MAPPING_KEYS_CHECK",
+        "METHOD_CODE_MATCH",
+        "NATIVE_METHOD_MATCH",
         "NONE_MATCH",
         "NOT_NONE_MATCH",
         "NOT_PRESENT_IN_GENERIC_DICT",
