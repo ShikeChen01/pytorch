@@ -772,6 +772,31 @@ class MyClassNotSerializable:
         return x + 1
 
 
+class LockHolder:
+    def __init__(self, scale):
+        self.scale = scale
+        self.lock = threading.Lock()
+
+
+class ReducedHolder:
+    def __init__(self, scale, cfg):
+        self.scale = scale
+        self.cfg = dict(cfg)
+
+    def __reduce__(self):
+        return (ReducedHolder, (self.scale, self.cfg))
+
+
+@dataclasses.dataclass(frozen=True)
+class _Phase:
+    lr: float
+
+
+class _Schedule(enum.Enum):
+    WARMUP = _Phase(0.1)
+    STEADY = _Phase(1.0)
+
+
 class Inputs:
     def __init__(self, x, unused):
         self.x = x
@@ -3394,6 +3419,79 @@ class TestGuardSerialization(TestGuardSerializationBase):
                 self.assertEqual(
                     is_portable_identity_guard("ID_MATCH", (), value), expected
                 )
+
+    def test_guarded_user_object_prunes_unguarded_attributes(self):
+        def fn(x, holder):
+            return x * holder.scale
+
+        x = torch.randn(3)
+
+        ref, loaded = self._test_serialization("CONSTANT_MATCH", fn, x, LockHolder(2))
+        self._test_check_fn(ref, loaded, {"x": x, "holder": LockHolder(2)}, True)
+        self._test_check_fn(ref, loaded, {"x": x, "holder": LockHolder(3)}, False)
+
+    def test_guarded_user_object_with_a_reducer_is_pickled_whole(self):
+        def fn(x, holder):
+            return x * holder.scale
+
+        x = torch.randn(3)
+        holder = ReducedHolder(2, {"mode": "eval"})
+
+        # __reduce__ passes the unguarded cfg to __init__, which would fail on
+        # the pruning sentinel at load.
+        ref, loaded = self._test_serialization("CONSTANT_MATCH", fn, x, holder)
+        self._test_check_fn(ref, loaded, {"x": x, "holder": holder}, True)
+        self._test_check_fn(
+            ref, loaded, {"x": x, "holder": ReducedHolder(3, {})}, False
+        )
+
+    def test_guarded_enum_member_keeps_its_value(self):
+        def fn(x, mode):
+            if mode is _Schedule.WARMUP:
+                return x + 1
+            return x - 1
+
+        x = torch.randn(3)
+
+        ref, loaded = self._test_serialization("ID_MATCH", fn, x, _Schedule.WARMUP)
+        self._test_check_fn(ref, loaded, {"x": x, "mode": _Schedule.WARMUP}, True)
+        self._test_check_fn(ref, loaded, {"x": x, "mode": _Schedule.STEADY}, False)
+
+    def test_nested_guarded_user_objects_are_pruned_in_turn(self):
+        def fn(x, holder):
+            return x * holder.scale.scale
+
+        x = torch.randn(3)
+
+        ref, loaded = self._test_serialization(
+            "CONSTANT_MATCH", fn, x, LockHolder(LockHolder(2))
+        )
+        self._test_check_fn(
+            ref, loaded, {"x": x, "holder": LockHolder(LockHolder(2))}, True
+        )
+        self._test_check_fn(
+            ref, loaded, {"x": x, "holder": LockHolder(LockHolder(3))}, False
+        )
+
+    def test_attribute_guarded_through_another_object_is_kept(self):
+        def fn(x, a, b):
+            return x * a.scale + b.scale.scale
+
+        def inputs(inner):
+            shared = LockHolder(inner)
+            a = LockHolder(2)
+            a.shared = shared
+            return {"x": x, "a": a, "b": LockHolder(shared)}
+
+        x = torch.randn(3)
+        args = inputs(3)
+
+        # a.shared is unguarded through a but guarded through b.
+        ref, loaded = self._test_serialization(
+            "CONSTANT_MATCH", fn, x, args["a"], args["b"]
+        )
+        self._test_check_fn(ref, loaded, inputs(3), True)
+        self._test_check_fn(ref, loaded, inputs(4), False)
 
     def test_closure_match(self):
         def fn(x):

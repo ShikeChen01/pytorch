@@ -21,6 +21,7 @@ import ast
 import builtins
 import collections
 import contextlib
+import copyreg
 import dataclasses
 import enum
 import functools
@@ -4225,6 +4226,22 @@ def _get_unsupported_types() -> tuple[type, ...]:
     return ret
 
 
+def _pickles_from_dict(cls: type) -> bool:
+    """Whether pickle rebuilds an instance of cls by restoring its ``__dict__``,
+    with no hook that could read a pruned attribute (an Enum member's
+    ``__reduce_ex__`` passes ``_value_`` to the class, for one)."""
+    object_getstate = getattr(object, "__getstate__", None)
+    return (
+        cls not in copyreg.dispatch_table
+        and cls.__reduce_ex__ is object.__reduce_ex__
+        and cls.__reduce__ is object.__reduce__
+        and getattr(cls, "__getstate__", None) is object_getstate
+        and not hasattr(cls, "__setstate__")
+        and not hasattr(cls, "__getnewargs_ex__")
+        and not hasattr(cls, "__getnewargs__")
+    )
+
+
 def _is_shared_constant(value: Any) -> bool:
     """Whether pruning ``value`` by id would poison unrelated references to it.
 
@@ -4901,18 +4918,37 @@ class GuardsStatePickler(FunctionPicklerBase):
                     )
                 return type(self)._unpickle_fsdp_module_type, (original_type,)
 
+        if (
+            id(obj) in self.guard_tree_values
+            and hasattr(obj, "__dict__")
+            and not inspect.isclass(obj)
+            and not inspect.ismodule(obj)
+            and not inspect.isroutine(obj)
+            and not isinstance(obj, (torch.nn.Module, torch.Tensor))
+            and not type(obj).__module__.startswith("torch.")
+            and _pickles_from_dict(type(obj))
+        ):
+            # A guarded user object (a train pipeline, a wrapper holding a
+            # dataloader) would otherwise be pickled whole, so one unguarded
+            # unpicklable attribute takes the frame down. Last, so the specific
+            # reducers above get first refusal; user types only, since torch's
+            # structural types (DTensorSpec) need fields no guard names.
+            self._prune_unguarded_attributes(obj)
+
         return NotImplemented
 
-    def _prune_unguarded_attributes(self, obj: torch.nn.Module) -> None:
+    def _prune_unguarded_attributes(self, obj: Any) -> None:
         """Mark every ``__dict__`` value nothing guards as prunable.
 
-        Reaching a module through the guard tree does not mean its whole state
+        Reaching an object through the guard tree does not mean its whole state
         is needed, only the attributes a guard actually reads. The rest becomes
         the _Missing sentinel, which is what keeps an unpicklable bystander (a
         generator, a live iterator, a C handle) from taking the frame down.
-        What the module itself reads back at load stays: the containers in
-        _NN_MODULE_STATE_ATTRS. Precondition: the caller has checked that the
-        module's __setstate__ is nn.Module's, since any other may read anything.
+        What an nn.Module itself reads back at load stays: the containers in
+        _NN_MODULE_STATE_ATTRS. Precondition: the caller has checked that
+        unpickling obj reads nothing but its ``__dict__`` back (nn.Module's
+        __setstate__, or ``_pickles_from_dict``), since any other hook may read
+        anything.
         """
         for name, attr in obj.__dict__.items():
             if isinstance(attr, (torch.Tensor, torch.nn.Module)):
