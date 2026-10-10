@@ -1367,17 +1367,55 @@ class TestTorchDeviceType(TestCase):
             'max_pool3d_with_indices_backward_cuda',
             torch.device(device).type == 'cuda')
 
-    @skipIfTorchInductor("https://github.com/pytorch/pytorch/issues/113707")
-    def test_nondeterministic_alert_AdaptiveMaxPool2d(self, device):
-        module = torch.nn.AdaptiveMaxPool2d(3)
-        input = torch.randn(2, 3, 3, requires_grad=True, device=device)
-        res = module(input)
-        grad = torch.ones_like(res)
+    @skipIfTorchInductor("aot-autograd issue")
+    @dtypes(torch.float, torch.double, torch.half, torch.bfloat16)
+    def test_deterministic_adaptive_max_pool2d(self, device, dtype):
+        F = torch.nn.functional
+        test_cases = [
+            # pool function, input size, output size
+            (F.adaptive_max_pool2d, (2, 3, 13, 13), (6, 6)),  # overlapping windows
+            (F.adaptive_max_pool2d, (2, 3, 13, 9), (6, 4)),  # non-square
+            (F.adaptive_max_pool2d, (3, 13, 13), (6, 6)),  # unbatched
+            (F.adaptive_max_pool2d, (2, 3, 3, 3), (8, 7)),  # output larger than input
+            (F.adaptive_max_pool2d, (2, 3, 12, 12), (6, 6)),  # non-overlapping windows
+            (F.adaptive_max_pool2d, (2, 3, 5, 5), (5, 5)),  # identity windows
+            (F.adaptive_max_pool1d, (2, 3, 17), (5,)),  # 1d goes through 2d
+            (F.adaptive_max_pool1d, (3, 4), (9,)),  # unbatched 1d, upsampling
+        ]
+        tol = {
+            torch.half: dict(atol=1e-2, rtol=1e-2),
+            torch.bfloat16: dict(atol=5e-2, rtol=5e-2),
+        }.get(dtype, {})
 
-        self.check_nondeterministic_alert(
-            lambda: res.backward(grad, retain_graph=True),
-            'adaptive_max_pool2d_backward_cuda',
-            torch.device(device).type == 'cuda')
+        for (fn, size, output_size), channels_last in product(test_cases, (False, True)):
+            if channels_last and len(size) != 4:
+                continue
+            input = torch.randn(size, device=device, dtype=dtype)
+            if channels_last:
+                input = input.contiguous(memory_format=torch.channels_last)
+            input.requires_grad_()
+            res = fn(input, output_size)
+            grad_out = torch.randn_like(res)
+
+            # Reference computed in float64 on CPU (same argmax since the
+            # float64 values are exact copies of the inputs)
+            input_ref = input.detach().cpu().double().requires_grad_()
+            res_ref = fn(input_ref, output_size)
+            self.assertEqual(res.cpu().double(), res_ref)
+            grad_ref, = torch.autograd.grad(res_ref, input_ref, grad_out.cpu().double())
+
+            # Default (possibly nondeterministic) implementation
+            grad_default, = torch.autograd.grad(res, input, grad_out, retain_graph=True)
+
+            with DeterministicGuard(True):
+                grads = [
+                    torch.autograd.grad(fn(input, output_size), input, grad_out)[0]
+                    for _ in range(5)
+                ]
+            for grad in grads[1:]:
+                self.assertEqual(grads[0], grad, atol=0, rtol=0)
+            self.assertEqual(grads[0], grad_ref.to(dtype), exact_device=False)
+            self.assertEqual(grads[0], grad_default, **tol)
 
     @skipIfTorchInductor("https://github.com/pytorch/pytorch/issues/113707")
     def test_nondeterministic_alert_FractionalMaxPool2d(self, device):

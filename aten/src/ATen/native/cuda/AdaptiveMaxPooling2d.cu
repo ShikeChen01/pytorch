@@ -1,5 +1,7 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
+#include <ATen/AccumulateType.h>
+#include <ATen/ceil_div.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/NumericLimits.cuh>
 #include <ATen/Dispatch.h>
@@ -197,6 +199,60 @@ __global__ void atomicadaptivemaxgradinput(
     }
   }
 }
+
+/*
+ * Description:
+ *    Deterministic version of atomicadaptivemaxgradinput, used when
+ *    torch.use_deterministic_algorithms(True) is set.
+ *    Gather-style: one thread per gradInput element (plane, ih, iw). The
+ *    output cells whose adaptive window contains ih are exactly
+ *    [start_index(ih, isizeH, osizeH), end_index(ih, isizeH, osizeH)) (and the
+ *    same for iw), so each thread visits that range in a fixed order and sums
+ *    the gradOutput entries whose argmax points at (ih, iw). No atomics are
+ *    used, so the result is bitwise reproducible.
+ *    gradOutput, indices and gradInput must be contiguous; planes are the
+ *    flattened batch and channel dimensions.
+ */
+template <typename T>
+__global__ void deterministicadaptivemaxgradinput(
+  T *gradInput, const T *gradOutput, const int64_t *indices,
+  int64_t nplanes, int64_t isizeH, int64_t isizeW,
+  int64_t osizeH, int64_t osizeW
+)
+{
+  using acc_t = at::acc_type<T, /*is_cuda=*/true>;
+  const int64_t isizeHW = isizeH * isizeW;
+  const int64_t osizeHW = osizeH * osizeW;
+  const int64_t numel = nplanes * isizeHW;
+  const int64_t step = static_cast<int64_t>(blockDim.x) * gridDim.x;
+
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < numel; index += step) {
+    const int64_t plane = index / isizeHW;
+    const int64_t pos = index - plane * isizeHW;
+    const int64_t ih = pos / isizeW;
+    const int64_t iw = pos - ih * isizeW;
+
+    const int64_t ohstart = start_index(ih, isizeH, osizeH);
+    const int64_t ohend = ::min(end_index(ih, isizeH, osizeH), osizeH);
+    const int64_t owstart = start_index(iw, isizeW, osizeW);
+    const int64_t owend = ::min(end_index(iw, isizeW, osizeW), osizeW);
+
+    const T *ptr_gradOutput = gradOutput + plane * osizeHW;
+    const int64_t *ptr_ind = indices + plane * osizeHW;
+
+    acc_t gradient = acc_t(0);
+    for (int64_t oh = ohstart; oh < ohend; ++oh) {
+      for (int64_t ow = owstart; ow < owend; ++ow) {
+        const int64_t o = oh * osizeW + ow;
+        if (ptr_ind[o] == pos) {
+          gradient += static_cast<acc_t>(ptr_gradOutput[o]);
+        }
+      }
+    }
+    gradInput[index] = static_cast<T>(gradient);
+  }
+}
 } // namespace
 
 // 4d tensor B x D x H x W
@@ -325,9 +381,6 @@ TORCH_IMPL_FUNC(adaptive_max_pool2d_backward_out_cuda)
  const Tensor& input,
  const Tensor& indices,
  const Tensor& gradInput) {
-  globalContext().alertNotDeterministic(
-      "adaptive_max_pool2d_backward_cuda");
-
   TensorArg grad_input_arg{gradInput, "gradInput", 1};
   TensorArg grad_output_arg{gradOutput, "gradOutput", 2};
   TensorArg input_arg{input, "input", 3};
@@ -338,6 +391,54 @@ TORCH_IMPL_FUNC(adaptive_max_pool2d_backward_out_cuda)
       {grad_input_arg, grad_output_arg, input_arg, indices_arg});
 
   if (gradOutput.numel() == 0) {
+    return;
+  }
+
+  // See Note [Enabling Deterministic Operations]
+  // The default kernels below scatter gradOutput into gradInput with atomic
+  // adds, whose order (and thus floating point result) varies between runs
+  // when adaptive windows overlap. In deterministic mode, gather instead.
+  if (globalContext().deterministicAlgorithms()) {
+    const at::Tensor gradOutput_ = gradOutput.contiguous();
+    const at::Tensor indices_ = indices.contiguous();
+    const at::Tensor gradInput_c = gradInput.is_contiguous() ? gradInput : at::empty(gradInput.sizes(), gradInput.options());
+
+    const int64_t isizeH = input.size(-2);
+    const int64_t isizeW = input.size(-1);
+    const int64_t osizeH = gradOutput_.size(-2);
+    const int64_t osizeW = gradOutput_.size(-1);
+    const int64_t nplanes = gradOutput_.numel() / (osizeH * osizeW);
+    const int64_t numel = nplanes * isizeH * isizeW;
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        kHalf,
+        kBFloat16,
+        input.scalar_type(),
+        "adaptive_max_pool2d_backward_cuda",
+        [&] {
+          constexpr int num_threads = 256;
+          const int64_t max_blocks = at::cuda::getCurrentDeviceProperties()->maxGridSize[0];
+          const int64_t num_blocks = std::min(
+              at::ceil_div(numel, static_cast<int64_t>(num_threads)), max_blocks);
+          deterministicadaptivemaxgradinput<<<
+              static_cast<unsigned int>(num_blocks),
+              num_threads,
+              0,
+              at::cuda::getCurrentCUDAStream()>>>(
+              gradInput_c.mutable_data_ptr<scalar_t>(),
+              gradOutput_.const_data_ptr<scalar_t>(),
+              indices_.const_data_ptr<int64_t>(),
+              nplanes,
+              isizeH,
+              isizeW,
+              osizeH,
+              osizeW);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+
+    if (!gradInput.is_contiguous()) {
+      gradInput.copy_(gradInput_c);
+    }
     return;
   }
 
