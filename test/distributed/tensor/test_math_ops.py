@@ -1523,6 +1523,19 @@ class DistMathOpsTest(DTensorContinuousTestBase):
                     self.assertTrue(output_dtensor.placements[0].is_shard(shard_dim))
                 self.assertEqual(output_dtensor.full_tensor(), output)
 
+        # An omitted or empty dim reduces over all dims.
+        for args in ((), (None,), ((),), ((), True)):
+            output = torch.logsumexp(inp, *args)
+            output_dtensor = torch.logsumexp(input_dtensor, *args)
+            self.assertTrue(output_dtensor.placements[0].is_replicate())
+            self.assertEqual(output_dtensor.full_tensor(), output)
+
+        # keepdim keeps the sharded dim's index.
+        input_dtensor = distribute_tensor(inp, device_mesh=mesh, placements=[Shard(1)])
+        output_dtensor = torch.logsumexp(input_dtensor, 0, keepdim=True)
+        self.assertTrue(output_dtensor.placements[0].is_shard(1))
+        self.assertEqual(output_dtensor.full_tensor(), torch.logsumexp(inp, 0, True))
+
     @with_comms
     def test_partial_reduction_ops(self):
         mesh = self.build_device_mesh()

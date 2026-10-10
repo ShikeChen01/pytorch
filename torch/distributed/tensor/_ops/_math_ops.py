@@ -1587,8 +1587,13 @@ def logsumexp_single_dim_strategy(
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
     ndim = len(input_meta.shape)
 
-    dims = _infer_reduction_dims(args_schema[1], ndim)
-    keep_dim = cast(bool, kwargs_schema.get("keepdim", False))
+    # An omitted or empty dim reduces over all dims.
+    dims_arg = args_schema[1] if len(args_schema) > 1 else None
+    dims = _infer_reduction_dims(dims_arg, ndim) or None
+    if len(args_schema) > 2:
+        keep_dim = bool(args_schema[2])
+    else:
+        keep_dim = cast(bool, kwargs_schema.get("keepdim", False))
     return _reduction_single_dim_strategy(
         args_schema,
         reduction_dims=dims,

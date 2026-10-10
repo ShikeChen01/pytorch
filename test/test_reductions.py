@@ -552,6 +552,34 @@ class TestReductions(TestCase):
         self.assertEqual(expected, actual)
 
     @skipIfNoSciPy
+    @dtypes(torch.float32, torch.float64)
+    def test_logsumexp_all_dims(self, device, dtype):
+        from scipy.special import logsumexp
+        a = torch.randn(3, 4, device=device, dtype=dtype)
+        expected = logsumexp(a.cpu().numpy())
+
+        for kwargs in ({}, {"dim": None}, {"dim": ()}, {"dim": []}):
+            actual = torch.logsumexp(a, **kwargs)
+            self.assertEqual(expected.shape, actual.shape)
+            self.assertEqual(expected, actual)
+            self.assertEqual(actual, a.logsumexp(**kwargs))
+            self.assertEqual(actual, torch.special.logsumexp(a, **kwargs))
+
+            actual_keepdim = torch.logsumexp(a, keepdim=True, **kwargs)
+            self.assertEqual(actual_keepdim.shape, (1, 1))
+            self.assertEqual(expected, actual_keepdim.squeeze())
+
+            out = torch.empty((), device=device, dtype=dtype)
+            torch.logsumexp(a, out=out, **kwargs)
+            self.assertEqual(expected, out)
+
+        self.assertEqual(torch.logsumexp(a), torch.logsumexp(a, (0, 1)))
+        # 0-dim input
+        self.assertEqual(torch.logsumexp(a[0, 0]), a[0, 0])
+        # all -inf input
+        self.assertEqual(torch.logsumexp(torch.full_like(a, -inf)), torch.tensor(-inf, dtype=dtype))
+
+    @skipIfNoSciPy
     @dtypes(torch.complex64, torch.complex128)
     def test_logcumsumexp_complex(self, device, dtype):
         # logcumsumexp is a more precise way to compute than ``log(cumsum(exp(a)))``
@@ -3619,10 +3647,7 @@ class TestReductions(TestCase):
                                  fn(master_input, dim=-2, keepdim=True).cpu().numpy(),
                                  msg=error_msg)
 
-                # logsumexp throws a type error when not specifying dim so test separately.
-                self.assertEqual(torch.full((), return_value, device=device), fn(master_input), msg=error_msg)
-            else:
-                self.assertRaises(TypeError, lambda: fn(master_input))
+            self.assertEqual(torch.full((), return_value, device=device), fn(master_input), msg=error_msg)
 
     # Tests to ensure that any() and all() functions work with zero-dim tensors. Kept separate from
     # other tests for checking reduction with zero-dim tensors because these tests have significantly

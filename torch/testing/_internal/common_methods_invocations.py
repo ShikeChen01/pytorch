@@ -1688,6 +1688,10 @@ def sample_inputs_logsumexp(self, device, dtype, requires_grad, **kwargs):
         ((S, S), (1,), False),
         ((S, S), (-2,), False),
         ((S, S), (0, 1), False),
+        # An empty dim reduces over all dims
+        ((), (), False),
+        ((S, S), (), False),
+        ((S, S), (), True),
     )
     # Test large inputs to check numerical stability
     lows = (None, 1e3, 1e6) if dtype in (torch.float32, torch.float64, torch.complex64, torch.complex128) else (None,)
@@ -1698,6 +1702,10 @@ def sample_inputs_logsumexp(self, device, dtype, requires_grad, **kwargs):
                             low=low, high=high,
                             requires_grad=requires_grad)
             yield SampleInput(t, dim, keepdim)
+
+    # dim omitted
+    yield SampleInput(make_tensor((S, S), dtype=dtype, device=device, requires_grad=requires_grad))
+    yield SampleInput(make_tensor((S, S), dtype=dtype, device=device, requires_grad=requires_grad), keepdim=True)
 
 def reference_inputs_logsumexp(op, device, dtype, requires_grad, **kwargs):
     yield from sample_inputs_logsumexp(op, device, dtype, requires_grad, **kwargs)
