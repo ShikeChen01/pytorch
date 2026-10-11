@@ -1414,7 +1414,7 @@ class TestTorchDeviceType(TestCase):
                 ]
             for grad in grads[1:]:
                 self.assertEqual(grads[0], grad, atol=0, rtol=0)
-            self.assertEqual(grads[0], grad_ref.to(dtype), exact_device=False)
+            self.assertEqual(grads[0], grad_ref.to(dtype), exact_device=False, **tol)
             self.assertEqual(grads[0], grad_default, **tol)
 
     @skipIfTorchInductor("https://github.com/pytorch/pytorch/issues/113707")

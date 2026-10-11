@@ -213,38 +213,41 @@ __global__ void atomicadaptivemaxgradinput(
  *    gradOutput, indices and gradInput must be contiguous; planes are the
  *    flattened batch and channel dimensions.
  */
-template <typename T>
+template <typename T, typename index_t>
 __global__ void deterministicadaptivemaxgradinput(
   T *gradInput, const T *gradOutput, const int64_t *indices,
-  int64_t nplanes, int64_t isizeH, int64_t isizeW,
-  int64_t osizeH, int64_t osizeW
+  index_t nplanes, index_t isizeH, index_t isizeW,
+  index_t osizeH, index_t osizeW
 )
 {
   using acc_t = at::acc_type<T, /*is_cuda=*/true>;
-  const int64_t isizeHW = isizeH * isizeW;
-  const int64_t osizeHW = osizeH * osizeW;
-  const int64_t numel = nplanes * isizeHW;
+  const index_t isizeHW = isizeH * isizeW;
+  const index_t osizeHW = osizeH * osizeW;
+  const int64_t numel = static_cast<int64_t>(nplanes) * isizeHW;
   const int64_t step = static_cast<int64_t>(blockDim.x) * gridDim.x;
 
-  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       index < numel; index += step) {
-    const int64_t plane = index / isizeHW;
-    const int64_t pos = index - plane * isizeHW;
-    const int64_t ih = pos / isizeW;
-    const int64_t iw = pos - ih * isizeW;
+  for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       linear < numel; linear += step) {
+    const index_t index = static_cast<index_t>(linear);
+    const index_t plane = index / isizeHW;
+    const index_t pos = index - plane * isizeHW;
+    const index_t ih = pos / isizeW;
+    const index_t iw = pos - ih * isizeW;
 
-    const int64_t ohstart = start_index(ih, isizeH, osizeH);
-    const int64_t ohend = ::min(end_index(ih, isizeH, osizeH), osizeH);
-    const int64_t owstart = start_index(iw, isizeW, osizeW);
-    const int64_t owend = ::min(end_index(iw, isizeW, osizeW), osizeW);
+    // start_index/end_index(i, isize, osize) specialized to i < isize and
+    // evaluated in index_t, since 64-bit division dominates the runtime.
+    const index_t ohstart = (ih * osizeH) / isizeH;
+    const index_t ohend = ::min(((ih + 1) * osizeH - 1) / isizeH + 1, osizeH);
+    const index_t owstart = (iw * osizeW) / isizeW;
+    const index_t owend = ::min(((iw + 1) * osizeW - 1) / isizeW + 1, osizeW);
 
-    const T *ptr_gradOutput = gradOutput + plane * osizeHW;
-    const int64_t *ptr_ind = indices + plane * osizeHW;
+    const T *ptr_gradOutput = gradOutput + static_cast<int64_t>(plane) * osizeHW;
+    const int64_t *ptr_ind = indices + static_cast<int64_t>(plane) * osizeHW;
 
     acc_t gradient = acc_t(0);
-    for (int64_t oh = ohstart; oh < ohend; ++oh) {
-      for (int64_t ow = owstart; ow < owend; ++ow) {
-        const int64_t o = oh * osizeW + ow;
+    for (index_t oh = ohstart; oh < ohend; ++oh) {
+      for (index_t ow = owstart; ow < owend; ++ow) {
+        const index_t o = oh * osizeW + ow;
         if (ptr_ind[o] == pos) {
           gradient += static_cast<acc_t>(ptr_gradOutput[o]);
         }
@@ -397,8 +400,13 @@ TORCH_IMPL_FUNC(adaptive_max_pool2d_backward_out_cuda)
   // See Note [Enabling Deterministic Operations]
   // The default kernels below scatter gradOutput into gradInput with atomic
   // adds, whose order (and thus floating point result) varies between runs
-  // when adaptive windows overlap. In deterministic mode, gather instead.
-  if (globalContext().deterministicAlgorithms()) {
+  // when adaptive windows overlap. Windows are disjoint iff each input size is
+  // divisible by the output size; then every gradInput element receives at
+  // most one add and the default path is already deterministic. Otherwise, in
+  // deterministic mode, gather instead.
+  const bool windows_overlap = input.size(-2) % gradOutput.size(-2) != 0 ||
+      input.size(-1) % gradOutput.size(-1) != 0;
+  if (globalContext().deterministicAlgorithms() && windows_overlap) {
     const at::Tensor gradOutput_ = gradOutput.contiguous();
     const at::Tensor indices_ = indices.contiguous();
     const at::Tensor gradInput_c = gradInput.is_contiguous() ? gradInput : at::empty(gradInput.sizes(), gradInput.options());
@@ -407,8 +415,18 @@ TORCH_IMPL_FUNC(adaptive_max_pool2d_backward_out_cuda)
     const int64_t isizeW = input.size(-1);
     const int64_t osizeH = gradOutput_.size(-2);
     const int64_t osizeW = gradOutput_.size(-1);
+
     const int64_t nplanes = gradOutput_.numel() / (osizeH * osizeW);
     const int64_t numel = nplanes * isizeH * isizeW;
+
+    // The int32 path needs every intermediate of the index math to fit.
+    constexpr int64_t int32_max = std::numeric_limits<int32_t>::max();
+    const bool use_int32 = numel <= int32_max && gradOutput_.numel() <= int32_max &&
+        isizeH * osizeH <= int32_max && isizeW * osizeW <= int32_max;
+    constexpr int num_threads = 256;
+    const int64_t max_blocks = at::cuda::getCurrentDeviceProperties()->maxGridSize[0];
+    const auto num_blocks = static_cast<unsigned int>(std::min(
+        at::ceil_div(numel, static_cast<int64_t>(num_threads)), max_blocks));
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         kHalf,
@@ -416,24 +434,25 @@ TORCH_IMPL_FUNC(adaptive_max_pool2d_backward_out_cuda)
         input.scalar_type(),
         "adaptive_max_pool2d_backward_cuda",
         [&] {
-          constexpr int num_threads = 256;
-          const int64_t max_blocks = at::cuda::getCurrentDeviceProperties()->maxGridSize[0];
-          const int64_t num_blocks = std::min(
-              at::ceil_div(numel, static_cast<int64_t>(num_threads)), max_blocks);
-          deterministicadaptivemaxgradinput<<<
-              static_cast<unsigned int>(num_blocks),
-              num_threads,
-              0,
-              at::cuda::getCurrentCUDAStream()>>>(
-              gradInput_c.mutable_data_ptr<scalar_t>(),
-              gradOutput_.const_data_ptr<scalar_t>(),
-              indices_.const_data_ptr<int64_t>(),
-              nplanes,
-              isizeH,
-              isizeW,
-              osizeH,
-              osizeW);
-          C10_CUDA_KERNEL_LAUNCH_CHECK();
+          auto launch = [&](auto index_zero) {
+            using index_t = decltype(index_zero);
+            deterministicadaptivemaxgradinput<scalar_t, index_t>
+                <<<num_blocks, num_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                    gradInput_c.mutable_data_ptr<scalar_t>(),
+                    gradOutput_.const_data_ptr<scalar_t>(),
+                    indices_.const_data_ptr<int64_t>(),
+                    nplanes,
+                    isizeH,
+                    isizeW,
+                    osizeH,
+                    osizeW);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+          };
+          if (use_int32) {
+            launch(int32_t(0));
+          } else {
+            launch(int64_t(0));
+          }
         });
 
     if (!gradInput.is_contiguous()) {
